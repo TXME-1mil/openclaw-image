@@ -1,12 +1,16 @@
 #!/bin/bash
-# AgentVolt entrypoint for the bundled OpenClaw + bridge image.
+# AgentVolt entrypoint for the bundled OpenClaw + bridge image (v7).
 #
 # Boot sequence:
 #   1. Apply env-driven config (gateway token, providers, allowed origins)
 #   2. Write per-agent auth-profiles.json so the agent has API keys on boot
-#   3. Start the gateway on an internal-only port (18789)
-#   4. Start the HTTP bridge on the public port (18790)
-#   5. Supervise both — if either dies, exit so Fly restarts the machine
+#   3. Seed the agent workspace (AGENTS.md / SOUL.md) so the persona is set
+#      before the first chat turn — otherwise the agent introduces itself
+#      as "Hey, I just came online. Who am I?"
+#   4. Start the gateway on an internal-only port (18789)
+#   5. Start the HTTP bridge on the public port (18790) — the bridge keeps
+#      a persistent WebSocket open to the gateway (v7 change)
+#   6. Supervise both — if either dies, exit so Fly restarts the machine
 #
 # Env contract (all set by Fly secrets or machine config):
 #   GATEWAY_TOKEN              required — Bearer token shared with Next.js
@@ -14,6 +18,9 @@
 #   ANTHROPIC_API_KEY          optional — fallback provider
 #   GOOGLE_API_KEY             optional — last-resort fallback
 #   OPENCLAW_ALLOWED_ORIGINS   optional — comma-separated CORS origins
+#   AGENT_NAME                 optional — display name for the persona
+#   AGENT_PERSONA_AGENTS_MD    optional — full AGENTS.md contents (overrides default)
+#   AGENT_PERSONA_SOUL_MD      optional — full SOUL.md contents (overrides default)
 #   GATEWAY_PORT               default 18789 (internal)
 #   BRIDGE_PORT                default 18790 (public)
 
@@ -172,6 +179,76 @@ if [ "$AGENT_PROFILES" != '{"version":1,"profiles":{},"order":{},"lastGood":{}}'
     echo "[entrypoint] value was: $AGENT_PROFILES" >&2
     exit 1
   fi
+fi
+
+# ---- Persona seeding -----------------------------------------------------
+# The agent loads AGENTS.md (operating guidance) and SOUL.md (persona/tone)
+# from its workspace directory on every chat turn. Without these the agent
+# starts every conversation with "Hey, I just came online. Who am I?",
+# which makes the bot feel broken even when chat itself is working.
+#
+# Workspace dir = $HOME/.openclaw/workspace = /data/.openclaw/workspace
+#
+# We write *_missing_*: if a file already exists (e.g. user mounted in a
+# custom one or persisted state from a previous run), we leave it alone.
+WORKSPACE_DIR="$HOME/.openclaw/workspace"
+mkdir -p "$WORKSPACE_DIR"
+
+: "${AGENT_NAME:=AgentVolt}"
+
+write_if_missing() {
+  local path="$1"
+  local content="$2"
+  if [ ! -s "$path" ]; then
+    printf '%s' "$content" > "$path"
+    echo "[entrypoint] seeded $(basename "$path")" >&2
+  fi
+}
+
+# Default AGENTS.md establishes the operating contract. Kept short so it
+# doesn't dominate the system prompt budget; user can override via env.
+DEFAULT_AGENTS_MD="# AGENTS.md
+
+You are ${AGENT_NAME}, a personal AI assistant deployed via AgentVolt.
+
+## Identity
+- Your name is ${AGENT_NAME}.
+- You run as a long-lived assistant: each chat continues the same session — there is no \"who am I\" reset between turns.
+- When greeted, respond as ${AGENT_NAME} and be helpful immediately. Do NOT ask \"who am I?\" or describe yourself as just-booted.
+
+## Style
+- Be concise and direct. Match the user's tone.
+- When the user asks for code, write the code. When they ask a question, answer it.
+- Don't narrate what you're about to do — just do it.
+
+## Capabilities
+- You have tool access for code execution, file edits, and web search when needed.
+- Use tools when they materially help; otherwise answer from context.
+"
+
+DEFAULT_SOUL_MD="# SOUL.md
+
+I am ${AGENT_NAME}.
+
+I am calm, direct, and warm. I treat the user as a capable peer.
+
+I do not pretend to be discovering my identity — I know who I am, and I get to work.
+
+When I make a mistake, I name it and correct it without melodrama.
+"
+
+if [ -n "${AGENT_PERSONA_AGENTS_MD:-}" ]; then
+  printf '%s' "$AGENT_PERSONA_AGENTS_MD" > "$WORKSPACE_DIR/AGENTS.md"
+  echo "[entrypoint] AGENTS.md set from env" >&2
+else
+  write_if_missing "$WORKSPACE_DIR/AGENTS.md" "$DEFAULT_AGENTS_MD"
+fi
+
+if [ -n "${AGENT_PERSONA_SOUL_MD:-}" ]; then
+  printf '%s' "$AGENT_PERSONA_SOUL_MD" > "$WORKSPACE_DIR/SOUL.md"
+  echo "[entrypoint] SOUL.md set from env" >&2
+else
+  write_if_missing "$WORKSPACE_DIR/SOUL.md" "$DEFAULT_SOUL_MD"
 fi
 
 # ---- Process supervision -------------------------------------------------

@@ -1,44 +1,57 @@
 #!/usr/bin/env python3
-"""AgentVolt HTTP bridge.
+"""AgentVolt HTTP bridge — v7 (persistent WebSocket).
 
 Listens on $BRIDGE_PORT (default 18790) and proxies a small HTTP surface
-to the local OpenClaw CLI:
+to the local OpenClaw gateway over a single, long-lived WebSocket. Each
+HTTP request maps to one (or a few) RPC calls on that socket — no more
+forking the OpenClaw CLI per request, which used to add 3.5s warm /
+~30s cold per call and made the dashboard "Disconnected" badge stick.
 
-    GET  /health         healthcheck
+HTTP surface (unchanged from v6 so the AC frontend doesn't need updates):
+    GET  /health         healthcheck — also reports WS connection state
     GET  /capabilities   bridge feature flags
     GET  /chat/history   list chat history (DB-friendly shape)
     POST /chat/send      send message, poll for response (or fire-and-forget)
     POST /chat/stream    SSE: status / heartbeat / token / done / error
-    GET  /debug/stats    /proc/meminfo + uptime
-
-Wire-compatible with the Hetzner bridge (lib/openclaw.ts buildBridgeScript)
-so Next.js routes work unchanged. The only differences:
-  - reads GATEWAY_TOKEN + BRIDGE_PORT from env (no per-instance image build)
-  - calls `openclaw` directly (no `docker exec` prefix; we ARE the container)
-  - dropped docker-specific debug endpoints (/debug/logs, /debug/ps); the
-    docker exec memory probe in /debug/stats is replaced with /proc reads
+    GET  /debug/stats    /proc/meminfo + uptime + WS state
 """
+import asyncio
 import http.server
 import json
 import os
 import socketserver
-import subprocess
 import sys
 import threading
 import time
 import uuid
+from typing import Any, Optional
+
+import websockets
+from websockets.exceptions import ConnectionClosed
 
 GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "")
-PORT = int(os.environ.get("BRIDGE_PORT", "18790"))
-BRIDGE_VERSION = 6
+GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "18789"))
+BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "18790"))
+GATEWAY_URL = os.environ.get("GATEWAY_URL", f"ws://127.0.0.1:{GATEWAY_PORT}/")
+BRIDGE_VERSION = 7
 SESSION_KEY = "agent:main:main"
+PROTOCOL_VERSION = 4
 # Cap on request body size for /chat/send and /chat/stream. Defends against
 # a malicious Content-Length header allocating arbitrary memory. A chat
 # message of 256KB is plenty (~50 pages of plain text).
 MAX_BODY_BYTES = 256 * 1024
+# Operator scopes — must match what the CLI used to claim. The gateway
+# treats a local backend client with shared-token auth as trusted (see
+# shouldSkipLocalBackendSelfPairing) so device pairing is bypassed.
+OPERATOR_SCOPES = [
+    "operator.admin",
+    "operator.read",
+    "operator.write",
+    "operator.approvals",
+    "operator.pairing",
+    "operator.talk.secrets",
+]
 
-# Hetzner bridge transforms — keep behavior identical so the UI doesn't
-# regress between providers.
 ERROR_REWRITES = (
     (
         "[assistant turn failed before producing content]",
@@ -62,27 +75,7 @@ def _rewrite_error(text: str) -> str:
     return text
 
 
-def _call_gateway(method: str, params: dict, timeout: float = 45.0):
-    """Run `openclaw gateway call <method> --json --params <json>` and return
-    the parsed result (or raise subprocess.TimeoutExpired).
-
-    The timeout is in seconds. Use a SHORT timeout (≤8s) when calling from
-    inside the chat-send poll loop — long timeouts there compound: each
-    sleep+call iteration burns up to (1.5 + timeout)s, and 35 iterations of
-    1.5+45 = 27 minutes wall time per stuck request. The default 45s is for
-    one-shot interactive calls."""
-    args = [
-        "openclaw", "gateway", "call", method,
-        "--token", GATEWAY_TOKEN,
-        "--json",
-        "--params", json.dumps(params),
-    ]
-    return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-
-
 def _filter_messages(messages):
-    """Drop heartbeats / empty messages, rewrite known error strings. Returns
-    [{role, content, timestamp}, ...]."""
     out = []
     for m in messages:
         if not m.get("content"):
@@ -103,6 +96,229 @@ def _filter_messages(messages):
             "timestamp": m.get("timestamp", 0),
         })
     return out
+
+
+class GatewayClient:
+    """Persistent WebSocket connection to the local OpenClaw gateway.
+
+    Owns its own asyncio loop in a background thread. Sync callers from
+    the HTTP handler threads use `request()` which submits a coroutine
+    to that loop and blocks for the result.
+
+    Reconnects on close with exponential backoff. While disconnected,
+    pending requests fail fast with GatewayUnavailable so HTTP handlers
+    can return 503 instead of hanging.
+    """
+
+    def __init__(self, url: str, token: str):
+        self.url = url
+        self.token = token
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ws = None
+        self._pending: dict[str, asyncio.Future] = {}
+        self._connected = asyncio.Event()  # bound to loop after start
+        self._stopping = False
+        self._connect_attempts = 0
+        self._last_error: Optional[str] = None
+        self._connected_since_ms: Optional[int] = None
+
+    # ---- lifecycle -----------------------------------------------------
+    def start(self):
+        ready = threading.Event()
+
+        def _run():
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self._connected = asyncio.Event()
+            ready.set()
+            self.loop.create_task(self._connect_forever())
+            self.loop.run_forever()
+
+        self._thread = threading.Thread(target=_run, daemon=True, name="gw-ws")
+        self._thread.start()
+        ready.wait(timeout=5)
+
+    def status(self) -> dict:
+        return {
+            "url": self.url,
+            "connected": bool(self._ws is not None),
+            "connectedSinceMs": self._connected_since_ms,
+            "connectAttempts": self._connect_attempts,
+            "lastError": self._last_error,
+            "pending": len(self._pending),
+        }
+
+    # ---- connection management ----------------------------------------
+    async def _connect_forever(self):
+        backoff = 1.0
+        while not self._stopping:
+            self._connect_attempts += 1
+            try:
+                # max_size matches the gateway's MAX_PAYLOAD; keeping it
+                # generous because chat history responses can be large.
+                async with websockets.connect(
+                    self.url,
+                    open_timeout=10,
+                    close_timeout=5,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=8 * 1024 * 1024,
+                ) as ws:
+                    await self._handshake(ws)
+                    self._ws = ws
+                    self._connected.set()
+                    self._connected_since_ms = int(time.time() * 1000)
+                    self._last_error = None
+                    backoff = 1.0
+                    print(
+                        f"[bridge] gateway connected ({self.url})",
+                        flush=True,
+                    )
+                    try:
+                        await self._read_loop(ws)
+                    finally:
+                        self._ws = None
+                        self._connected.clear()
+                        self._connected_since_ms = None
+                        # Any callers blocked waiting for a response need
+                        # to be woken so they can return an error.
+                        self._fail_all_pending(GatewayUnavailable("connection closed"))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._last_error = f"{type(e).__name__}: {e}"
+                print(f"[bridge] gateway connect failed: {self._last_error}", file=sys.stderr, flush=True)
+            if self._stopping:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 1.7, 15.0)
+
+    async def _handshake(self, ws):
+        connect_id = uuid.uuid4().hex
+        params = {
+            "minProtocol": PROTOCOL_VERSION,
+            "maxProtocol": PROTOCOL_VERSION,
+            "client": {
+                "id": "gateway-client",
+                "displayName": "av-bridge",
+                "version": f"{BRIDGE_VERSION}.0.0",
+                "platform": "linux",
+                "mode": "backend",
+                "instanceId": uuid.uuid4().hex,
+            },
+            "auth": {"token": self.token},
+            "role": "operator",
+            "scopes": OPERATOR_SCOPES,
+        }
+        await ws.send(json.dumps({
+            "type": "req",
+            "id": connect_id,
+            "method": "connect",
+            "params": params,
+        }))
+        # Server replies with {type:"res", id, ok:true, payload:{type:"hello-ok", ...}}
+        raw = await asyncio.wait_for(ws.recv(), timeout=15)
+        frame = json.loads(raw)
+        if frame.get("type") != "res" or frame.get("id") != connect_id:
+            raise RuntimeError(f"unexpected handshake frame: {frame}")
+        if not frame.get("ok"):
+            raise RuntimeError(f"handshake rejected: {frame.get('error')}")
+        payload = frame.get("payload", {})
+        if payload.get("type") != "hello-ok":
+            raise RuntimeError(f"handshake missing hello-ok: {payload}")
+
+    async def _read_loop(self, ws):
+        async for raw in ws:
+            try:
+                frame = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            ftype = frame.get("type")
+            if ftype == "res":
+                fid = frame.get("id")
+                fut = self._pending.pop(fid, None)
+                if fut is not None and not fut.done():
+                    if frame.get("ok"):
+                        fut.set_result(frame.get("payload"))
+                    else:
+                        err = frame.get("error") or {}
+                        msg = err.get("message") or json.dumps(err)
+                        fut.set_exception(GatewayRpcError(msg, err))
+            # event / tick / shutdown frames are ignored — v7 still
+            # uses request/response only. Could subscribe to chat
+            # events later for true streaming.
+
+    def _fail_all_pending(self, err: Exception):
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(err)
+        self._pending.clear()
+
+    # ---- request API (called from HTTP handler threads) ----------------
+    def request(self, method: str, params: dict, timeout: float = 30.0) -> Any:
+        """Send an RPC and block (in the calling thread) until the response
+        comes back, the gateway disconnects, or the timeout fires."""
+        if self.loop is None or not self.loop.is_running():
+            raise GatewayUnavailable("gateway client not started")
+        fut = asyncio.run_coroutine_threadsafe(
+            self._do_request(method, params, timeout),
+            self.loop,
+        )
+        try:
+            return fut.result(timeout=timeout + 2.0)
+        except asyncio.TimeoutError as e:
+            raise GatewayTimeout(f"timeout calling {method}") from e
+
+    async def _do_request(self, method: str, params: dict, timeout: float) -> Any:
+        if self._ws is None:
+            # Wait briefly for a reconnect to land. Don't wait forever —
+            # the HTTP caller has its own timeout.
+            try:
+                await asyncio.wait_for(self._connected.wait(), timeout=min(timeout, 5.0))
+            except asyncio.TimeoutError:
+                raise GatewayUnavailable("gateway disconnected")
+        if self._ws is None:
+            raise GatewayUnavailable("gateway disconnected")
+        rid = uuid.uuid4().hex
+        fut: asyncio.Future = self.loop.create_future()
+        self._pending[rid] = fut
+        try:
+            await self._ws.send(json.dumps({
+                "type": "req",
+                "id": rid,
+                "method": method,
+                "params": params,
+            }))
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (ConnectionClosed, OSError) as e:
+            self._pending.pop(rid, None)
+            raise GatewayUnavailable(f"send failed: {e}") from e
+        except asyncio.TimeoutError:
+            self._pending.pop(rid, None)
+            raise GatewayTimeout(f"timeout calling {method}")
+        finally:
+            self._pending.pop(rid, None)
+
+
+class GatewayUnavailable(Exception):
+    """Raised when no WebSocket is connected. HTTP layer should map to 503."""
+
+
+class GatewayTimeout(Exception):
+    """Raised when an RPC didn't get a response in time. HTTP layer maps to 504."""
+
+
+class GatewayRpcError(Exception):
+    """Raised when the gateway returned ok:false. Carries the error envelope."""
+
+    def __init__(self, message: str, envelope: dict | None = None):
+        super().__init__(message)
+        self.envelope = envelope or {}
+
+
+# Module-level singleton; populated in main() before the HTTP server starts.
+GATEWAY: Optional[GatewayClient] = None
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -127,8 +343,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return True
 
     def _read_body(self):
-        """Read and JSON-parse the request body with bounded size + validated
-        Content-Length. Returns (body_dict, None) on success or (None, error_response_status)."""
         raw_len = self.headers.get("Content-Length", "0")
         try:
             length = int(raw_len)
@@ -146,10 +360,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None, 400
 
     def log_message(self, *a):
-        # Default impl logs every request to stderr; Fly captures stdout/stderr
-        # so we mute the noisy access log. Errors still surface via stderr in
-        # the route handlers themselves.
         pass
+
+    def _gw_error_status(self, e: Exception) -> int:
+        if isinstance(e, GatewayUnavailable):
+            return 503
+        if isinstance(e, GatewayTimeout):
+            return 504
+        return 500
 
     # ---- routing -------------------------------------------------------
     def do_OPTIONS(self):
@@ -159,9 +377,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            return self._json({"ok": True, "version": BRIDGE_VERSION})
+            return self._health()
         if self.path == "/capabilities":
-            return self._json({"version": BRIDGE_VERSION, "streaming": True})
+            return self._json({
+                "version": BRIDGE_VERSION,
+                "streaming": True,
+                "transport": "websocket",
+            })
         if self.path.startswith("/chat/history"):
             return self._history()
         if self.path == "/debug/stats":
@@ -176,27 +398,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._json({"error": "Not found"}, 404)
 
     # ---- chat ----------------------------------------------------------
-    def _hist_raw(self, timeout: float = 45.0):
-        """Returns (messages, error, timed_out). On timeout, callers should
-        treat as transient and report 504 (not 500). Polling callers should
-        pass a SHORT timeout (≤8s); see _call_gateway docstring."""
+    def _health(self):
+        # /health stays unauthenticated so Fly + AC dashboard can probe
+        # without leaking the gateway token. The gateway connection state
+        # is included so the AC dashboard can show "Connected" only when
+        # the bridge actually has a live socket to the gateway.
+        st = GATEWAY.status() if GATEWAY else {"connected": False}
+        ok = bool(st.get("connected"))
+        return self._json({
+            "ok": ok,
+            "version": BRIDGE_VERSION,
+            "gateway": st,
+        }, status=200 if ok else 503)
+
+    def _hist_raw(self, timeout: float = 10.0):
         try:
-            r = _call_gateway("chat.history", {"sessionKey": SESSION_KEY}, timeout=timeout)
-            if r.returncode != 0:
-                return None, r.stderr.strip(), False
-            data = json.loads(r.stdout)
-            return _filter_messages(data.get("messages", [])), None, False
-        except subprocess.TimeoutExpired as e:
-            return None, f"gateway timeout: {e}", True
-        except Exception as e:
+            payload = GATEWAY.request(
+                "chat.history",
+                {"sessionKey": SESSION_KEY},
+                timeout=timeout,
+            )
+        except GatewayTimeout as e:
+            return None, str(e), True
+        except GatewayUnavailable as e:
             return None, str(e), False
+        except GatewayRpcError as e:
+            return None, str(e), False
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}", False
+        if not isinstance(payload, dict):
+            return [], None, False
+        return _filter_messages(payload.get("messages", [])), None, False
 
     def _history(self):
         if not self._auth():
             return
         msgs, err, timed_out = self._hist_raw()
         if err is not None:
-            return self._json({"error": err}, 504 if timed_out else 500)
+            return self._json({"error": err}, 504 if timed_out else 503)
         self._json({"messages": msgs})
 
     def _send(self):
@@ -205,7 +444,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             body, body_err = self._read_body()
             if body_err is not None:
-                return  # _read_body already responded
+                return
             msg = body.get("message", "")
             fire_and_forget = bool(body.get("fireAndForget"))
             if not isinstance(msg, str) or not msg.strip():
@@ -221,7 +460,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if fire_and_forget:
                 def _bg():
                     try:
-                        _call_gateway("chat.send", params, timeout=120)
+                        GATEWAY.request("chat.send", params, timeout=120)
                     except Exception as e:
                         print(f"[bridge] fire-and-forget send failed: {e}", file=sys.stderr)
                 threading.Thread(target=_bg, daemon=True).start()
@@ -229,30 +468,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             # Track the timestamp of the last assistant message we saw before
             # send — newer is the only reliable "new reply arrived" signal.
-            # The previous len-based check missed replies if openclaw produced
-            # zero net new history events (e.g. dedup'd send).
-            prev, _, _ = self._hist_raw(timeout=10.0)
+            prev, _, _ = self._hist_raw(timeout=8.0)
             prev_last_asst_ts = max(
                 (m.get("timestamp", 0) for m in (prev or []) if m.get("role") == "assistant"),
                 default=0,
             )
 
             try:
-                _call_gateway("chat.send", params, timeout=45.0)
-            except subprocess.TimeoutExpired:
+                GATEWAY.request("chat.send", params, timeout=45.0)
+            except GatewayTimeout:
                 pass  # send may finish even after timeout; we poll
 
-            # Cap at ~50s of polling so we exit before Vercel's 60s timeout.
-            # That leaves Vercel 10s to serialize + return the response.
-            # Each iteration must complete in ~(sleep + history-timeout) =
-            # 1.5 + 5 = 6.5s, so 8 iterations × ~6.5s ≈ 52s. The history
-            # timeout here is intentionally aggressive: if the gateway is
-            # slow enough that 5s isn't enough to read history, we should
-            # give up this turn and let the user retry, NOT pile up
-            # 45-second subprocess calls.
-            for _ in range(8):
-                time.sleep(1.5)
-                h, _, _ = self._hist_raw(timeout=5.0)
+            # Poll history for the new assistant reply. Each iteration is
+            # ~(sleep + history-timeout) ≈ 0.6 + 4 = 4.6s; 10 iterations
+            # ≈ 46s, leaving headroom under Vercel's 60s function timeout.
+            # Polls are now WS calls (~100-300ms each) instead of CLI
+            # forks (~3.5s warm), so we can tighten the loop a lot.
+            for _ in range(20):
+                time.sleep(0.6)
+                h, _, _ = self._hist_raw(timeout=4.0)
                 if not h:
                     continue
                 for m in reversed(h):
@@ -260,7 +494,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         return self._json(m)
             self._json({"error": "Response timeout"}, 504)
         except Exception as e:
-            self._json({"error": str(e)}, 500)
+            self._json({"error": str(e)}, self._gw_error_status(e))
 
     def _stream(self):
         if not self._auth():
@@ -291,7 +525,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise ConnectionError("Client disconnected")
 
             _sse("status", {"phase": "sending", "message": "Sending to agent..."})
-            prev, _, _ = self._hist_raw(timeout=10.0)
+            prev, _, _ = self._hist_raw(timeout=8.0)
             prev_last_asst_ts = max(
                 (m.get("timestamp", 0) for m in (prev or []) if m.get("role") == "assistant"),
                 default=0,
@@ -307,7 +541,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             def _do_send():
                 try:
-                    _call_gateway("chat.send", send_params, timeout=120)
+                    GATEWAY.request("chat.send", send_params, timeout=120)
                 except Exception:
                     pass
                 finally:
@@ -316,18 +550,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=_do_send, daemon=True).start()
             _sse("status", {"phase": "thinking", "message": "Agent is thinking..."})
 
-            # Cap polls so total elapsed (sleep + history-timeout) per
-            # iteration stays small and total wall time stays under Vercel's
-            # 60s function timeout. Iteration cost: 1.5s sleep + up to 5s
-            # history-timeout = ~6.5s, so 8 iterations ≈ 52s.
-            max_polls = 8
+            # Poll for the new assistant reply. WS calls are fast enough
+            # to poll every ~600ms; we send periodic heartbeats so the
+            # client knows we're still alive.
+            max_polls = 80  # ~50s wall time at 0.6s sleep + ~4s timeout
             found = False
             for i in range(max_polls):
-                time.sleep(1.5)
-                if i > 0 and i % 3 == 0:
-                    _sse("heartbeat", {"elapsed": int(i * 6.5)})
+                time.sleep(0.6)
+                if i > 0 and i % 8 == 0:
+                    _sse("heartbeat", {"elapsed": int(i * 0.6)})
 
-                h, _, _ = self._hist_raw(timeout=5.0)
+                h, _, _ = self._hist_raw(timeout=4.0)
                 if not h:
                     continue
                 latest_asst = None
@@ -369,7 +602,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _debug_stats(self):
         if not self._auth():
             return
-        out = {}
+        out = {"gateway": GATEWAY.status() if GATEWAY else None}
         try:
             with open("/proc/meminfo", "r") as f:
                 mem = {}
@@ -388,10 +621,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             out["host_meminfo_error"] = str(e)
         try:
-            r = subprocess.run(["uptime"], capture_output=True, text=True, timeout=5)
-            out["host_uptime"] = r.stdout.strip()
+            with open("/proc/loadavg", "r") as f:
+                out["host_loadavg"] = f.read().strip()
         except Exception as e:
-            out["host_uptime_error"] = str(e)
+            out["host_loadavg_error"] = str(e)
         try:
             with open("/proc/1/status", "r") as f:
                 status = {}
@@ -413,11 +646,17 @@ class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
+    global GATEWAY
     if not GATEWAY_TOKEN:
         print("[bridge] GATEWAY_TOKEN env var is required", file=sys.stderr)
         sys.exit(1)
-    server = ThreadingServer(("0.0.0.0", PORT), Handler)
-    print(f"[bridge v{BRIDGE_VERSION}] listening on 0.0.0.0:{PORT}", flush=True)
+    GATEWAY = GatewayClient(GATEWAY_URL, GATEWAY_TOKEN)
+    GATEWAY.start()
+    server = ThreadingServer(("0.0.0.0", BRIDGE_PORT), Handler)
+    print(
+        f"[bridge v{BRIDGE_VERSION}] listening on 0.0.0.0:{BRIDGE_PORT} → gateway {GATEWAY_URL}",
+        flush=True,
+    )
     server.serve_forever()
 
 
