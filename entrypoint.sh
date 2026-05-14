@@ -120,9 +120,18 @@ print(default_model)
 print(json.dumps({"version":1,"profiles":profiles,"order":order,"lastGood":last_good}, separators=_C))
 PY
 )
-PROVIDERS_JSON="${_AV_LINES[0]:-[]}"
+# Plain `${var:-default}` with curly-brace-containing defaults is fragile:
+# bash's brace-counting in parameter expansion was leaking the default into
+# the value even when _AV_LINES[2] was non-empty, producing an
+# auth-profiles.json with trailing garbage that broke OpenClaw's parser.
+# Explicit ifs are bulletproof.
+if [ -n "${_AV_LINES[0]:-}" ]; then PROVIDERS_JSON="${_AV_LINES[0]}"; else PROVIDERS_JSON='[]'; fi
 DEFAULT_MODEL="${_AV_LINES[1]:-}"
-AGENT_PROFILES="${_AV_LINES[2]:-{\"version\":1,\"profiles\":{},\"order\":{},\"lastGood\":{}}}"
+if [ -n "${_AV_LINES[2]:-}" ]; then
+  AGENT_PROFILES="${_AV_LINES[2]}"
+else
+  AGENT_PROFILES='{"version":1,"profiles":{},"order":{},"lastGood":{}}'
+fi
 unset _AV_LINES
 
 if [ "$PROVIDERS_JSON" != "[]" ]; then
