@@ -60,8 +60,13 @@ AGENT_PROFILES='{"version":1,"profiles":{},"order":{},"lastGood":{}}'
 # Build the providers batch + agent auth profiles using python3 (already
 # installed for the origins step). One JSON-aware pass beats shell heredoc
 # escaping when keys contain special chars.
-read PROVIDERS_JSON DEFAULT_MODEL AGENT_PROFILES <<EOF
-$(python3 <<'PY'
+#
+# Capture via `mapfile -t`, NOT `read` — `read X Y Z` only consumes one line
+# and splits it on IFS, which clobbers JSON that contains spaces. mapfile
+# reads each printed line into one array slot, preserving whitespace.
+# Belt-and-suspenders: json.dumps uses compact separators, so the output
+# also stays single-line and space-free regardless.
+mapfile -t _AV_LINES < <(python3 <<'PY'
 import json, os
 
 providers = []
@@ -109,14 +114,16 @@ if go:
 if len(fallback) > 1:
     providers.append({"path":"models.fallback","value":fallback})
 
-# Print three single-line tokens for the bash `read`. Use \\n separators so
-# nothing inside the JSON breaks the read.
-print(json.dumps(providers))
+_C = (",", ":")  # compact JSON — no whitespace inside the values
+print(json.dumps(providers, separators=_C))
 print(default_model)
-print(json.dumps({"version":1,"profiles":profiles,"order":order,"lastGood":last_good}))
+print(json.dumps({"version":1,"profiles":profiles,"order":order,"lastGood":last_good}, separators=_C))
 PY
 )
-EOF
+PROVIDERS_JSON="${_AV_LINES[0]:-[]}"
+DEFAULT_MODEL="${_AV_LINES[1]:-}"
+AGENT_PROFILES="${_AV_LINES[2]:-{\"version\":1,\"profiles\":{},\"order\":{},\"lastGood\":{}}}"
+unset _AV_LINES
 
 if [ "$PROVIDERS_JSON" != "[]" ]; then
   echo "$PROVIDERS_JSON" > /tmp/av-providers.json
