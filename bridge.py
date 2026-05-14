@@ -30,7 +30,7 @@ import uuid
 
 GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "")
 PORT = int(os.environ.get("BRIDGE_PORT", "18790"))
-BRIDGE_VERSION = 5
+BRIDGE_VERSION = 6
 SESSION_KEY = "agent:main:main"
 # Cap on request body size for /chat/send and /chat/stream. Defends against
 # a malicious Content-Length header allocating arbitrary memory. A chat
@@ -62,9 +62,15 @@ def _rewrite_error(text: str) -> str:
     return text
 
 
-def _call_gateway(method: str, params: dict, timeout: int = 45):
+def _call_gateway(method: str, params: dict, timeout: float = 45.0):
     """Run `openclaw gateway call <method> --json --params <json>` and return
-    the parsed result (or raise CalledProcessError)."""
+    the parsed result (or raise subprocess.TimeoutExpired).
+
+    The timeout is in seconds. Use a SHORT timeout (≤8s) when calling from
+    inside the chat-send poll loop — long timeouts there compound: each
+    sleep+call iteration burns up to (1.5 + timeout)s, and 35 iterations of
+    1.5+45 = 27 minutes wall time per stuck request. The default 45s is for
+    one-shot interactive calls."""
     args = [
         "openclaw", "gateway", "call", method,
         "--token", GATEWAY_TOKEN,
@@ -170,11 +176,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._json({"error": "Not found"}, 404)
 
     # ---- chat ----------------------------------------------------------
-    def _hist_raw(self):
+    def _hist_raw(self, timeout: float = 45.0):
         """Returns (messages, error, timed_out). On timeout, callers should
-        treat as transient and report 504 (not 500)."""
+        treat as transient and report 504 (not 500). Polling callers should
+        pass a SHORT timeout (≤8s); see _call_gateway docstring."""
         try:
-            r = _call_gateway("chat.history", {"sessionKey": SESSION_KEY})
+            r = _call_gateway("chat.history", {"sessionKey": SESSION_KEY}, timeout=timeout)
             if r.returncode != 0:
                 return None, r.stderr.strip(), False
             data = json.loads(r.stdout)
@@ -224,22 +231,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # send — newer is the only reliable "new reply arrived" signal.
             # The previous len-based check missed replies if openclaw produced
             # zero net new history events (e.g. dedup'd send).
-            prev, _, _ = self._hist_raw()
+            prev, _, _ = self._hist_raw(timeout=10.0)
             prev_last_asst_ts = max(
                 (m.get("timestamp", 0) for m in (prev or []) if m.get("role") == "assistant"),
                 default=0,
             )
 
             try:
-                _call_gateway("chat.send", params, timeout=45)
+                _call_gateway("chat.send", params, timeout=45.0)
             except subprocess.TimeoutExpired:
                 pass  # send may finish even after timeout; we poll
 
             # Cap at ~50s of polling so we exit before Vercel's 60s timeout.
             # That leaves Vercel 10s to serialize + return the response.
-            for _ in range(25):
-                time.sleep(2)
-                h, _, _ = self._hist_raw()
+            # Each iteration must complete in ~(sleep + history-timeout) =
+            # 1.5 + 5 = 6.5s, so 8 iterations × ~6.5s ≈ 52s. The history
+            # timeout here is intentionally aggressive: if the gateway is
+            # slow enough that 5s isn't enough to read history, we should
+            # give up this turn and let the user retry, NOT pile up
+            # 45-second subprocess calls.
+            for _ in range(8):
+                time.sleep(1.5)
+                h, _, _ = self._hist_raw(timeout=5.0)
                 if not h:
                     continue
                 for m in reversed(h):
@@ -278,7 +291,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise ConnectionError("Client disconnected")
 
             _sse("status", {"phase": "sending", "message": "Sending to agent..."})
-            prev, _, _ = self._hist_raw()
+            prev, _, _ = self._hist_raw(timeout=10.0)
             prev_last_asst_ts = max(
                 (m.get("timestamp", 0) for m in (prev or []) if m.get("role") == "assistant"),
                 default=0,
@@ -303,16 +316,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=_do_send, daemon=True).start()
             _sse("status", {"phase": "thinking", "message": "Agent is thinking..."})
 
-            # Cap polls so total elapsed (~52s) stays under Vercel's 60s
-            # function timeout — leaves 8s margin for the final stream flush.
-            max_polls = 35  # 35 * 1.5s = 52.5s
+            # Cap polls so total elapsed (sleep + history-timeout) per
+            # iteration stays small and total wall time stays under Vercel's
+            # 60s function timeout. Iteration cost: 1.5s sleep + up to 5s
+            # history-timeout = ~6.5s, so 8 iterations ≈ 52s.
+            max_polls = 8
             found = False
             for i in range(max_polls):
                 time.sleep(1.5)
                 if i > 0 and i % 3 == 0:
-                    _sse("heartbeat", {"elapsed": int(i * 1.5)})
+                    _sse("heartbeat", {"elapsed": int(i * 6.5)})
 
-                h, _, _ = self._hist_raw()
+                h, _, _ = self._hist_raw(timeout=5.0)
                 if not h:
                     continue
                 latest_asst = None
