@@ -1,7 +1,10 @@
 name: Build image
 
-# Builds and pushes ghcr.io/txme-1mil/openclaw on tags shaped
-# `openclaw-image/vN`. Triggered manually via workflow_dispatch as well.
+# Builds and pushes ghcr.io/txme-1mil/openclaw-image on tags shaped
+# `openclaw-image/vN`. (Package name matches the repo so it lives in a
+# fresh GHCR namespace — the legacy ghcr.io/txme-1mil/openclaw package
+# is still linked to the private ac repo and can't accept pushes from
+# here.) Triggered manually via workflow_dispatch as well.
 
 on:
   push:
@@ -50,7 +53,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/txme-1mil/openclaw:${{ steps.tag.outputs.value }}
-            ghcr.io/txme-1mil/openclaw:latest
+            ghcr.io/txme-1mil/openclaw-image:${{ steps.tag.outputs.value }}
+            ghcr.io/txme-1mil/openclaw-image:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
