@@ -17,7 +17,17 @@
 #   GATEWAY_PORT               default 18789 (internal)
 #   BRIDGE_PORT                default 18790 (public)
 
-set -eu
+set -eu -o pipefail
+
+# Helper: run a non-fatal openclaw command. Failures are logged loudly to
+# stderr so they show up in Fly logs (we missed a config-set failure for
+# days because everything was `|| true`).
+warn_run() {
+  local label="$1"; shift
+  if ! "$@" >/dev/null 2>&1; then
+    echo "[entrypoint] WARN: ${label} failed (exit $?): $*" >&2
+  fi
+}
 
 : "${GATEWAY_PORT:=18789}"
 : "${BRIDGE_PORT:=18790}"
@@ -34,22 +44,25 @@ fi
 mkdir -p "$OPENCLAW_STATE_DIR/agents/main/agent"
 
 # ---- Gateway config -------------------------------------------------------
-openclaw config set gateway.mode local >/dev/null 2>&1 || true
-openclaw config set gateway.auth.token "$GATEWAY_TOKEN" >/dev/null 2>&1 || true
+warn_run "config gateway.mode" openclaw config set gateway.mode local
+warn_run "config gateway.auth.token" openclaw config set gateway.auth.token "$GATEWAY_TOKEN"
 # Bonjour mDNS crashes in container environments (unhandled CIAO promise
 # rejection). It's only used for LAN gateway discovery, which we don't need.
-openclaw config set plugins.entries.bonjour.enabled false >/dev/null 2>&1 || true
+warn_run "disable bonjour" openclaw config set plugins.entries.bonjour.enabled false
 
 # Allowed origins for the gateway controlUi (browser-side CORS).
 if [ -n "${OPENCLAW_ALLOWED_ORIGINS:-}" ]; then
-  ORIGINS_JSON=$(printf '%s' "$OPENCLAW_ALLOWED_ORIGINS" | python3 -c "
+  if ORIGINS_JSON=$(printf '%s' "$OPENCLAW_ALLOWED_ORIGINS" | python3 -c "
 import sys, json
 items = [x.strip() for x in sys.stdin.read().split(',') if x.strip()]
 print(json.dumps({'path':'gateway.controlUi.allowedOrigins','value':items}))
-")
-  echo "[$ORIGINS_JSON]" > /tmp/av-origins.json
-  openclaw config set --batch-file /tmp/av-origins.json >/dev/null 2>&1 || true
-  rm -f /tmp/av-origins.json
+"); then
+    echo "[$ORIGINS_JSON]" > /tmp/av-origins.json
+    warn_run "set allowed origins" openclaw config set --batch-file /tmp/av-origins.json
+    rm -f /tmp/av-origins.json
+  else
+    echo "[entrypoint] WARN: failed to build origins JSON; skipping" >&2
+  fi
 fi
 
 # ---- Provider config + per-agent auth ------------------------------------
@@ -136,17 +149,29 @@ unset _AV_LINES
 
 if [ "$PROVIDERS_JSON" != "[]" ]; then
   echo "$PROVIDERS_JSON" > /tmp/av-providers.json
-  openclaw config set --batch-file /tmp/av-providers.json >/dev/null 2>&1 || true
+  warn_run "set providers" openclaw config set --batch-file /tmp/av-providers.json
   rm -f /tmp/av-providers.json
+else
+  echo "[entrypoint] WARN: no AI provider keys in env; agent will fail every chat turn" >&2
 fi
 
 if [ -n "$DEFAULT_MODEL" ]; then
-  openclaw models set "$DEFAULT_MODEL" >/dev/null 2>&1 || true
+  warn_run "set default model $DEFAULT_MODEL" openclaw models set "$DEFAULT_MODEL"
 fi
 
+# Validate that AGENT_PROFILES parses as JSON before writing — the previous
+# bash-parameter-expansion bug produced trailing-garbage strings that
+# silently broke OpenClaw's strict parser. A python json.loads round-trip
+# is cheap insurance.
 if [ "$AGENT_PROFILES" != '{"version":1,"profiles":{},"order":{},"lastGood":{}}' ]; then
-  echo "$AGENT_PROFILES" > "$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
-  chmod 600 "$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
+  if printf '%s' "$AGENT_PROFILES" | python3 -c "import json,sys; json.load(sys.stdin)"; then
+    printf '%s' "$AGENT_PROFILES" > "$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
+    chmod 600 "$OPENCLAW_STATE_DIR/agents/main/agent/auth-profiles.json"
+  else
+    echo "[entrypoint] ERROR: AGENT_PROFILES is not valid JSON; refusing to write auth-profiles.json" >&2
+    echo "[entrypoint] value was: $AGENT_PROFILES" >&2
+    exit 1
+  fi
 fi
 
 # ---- Process supervision -------------------------------------------------

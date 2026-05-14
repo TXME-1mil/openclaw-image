@@ -30,8 +30,12 @@ import uuid
 
 GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "")
 PORT = int(os.environ.get("BRIDGE_PORT", "18790"))
-BRIDGE_VERSION = 4
+BRIDGE_VERSION = 5
 SESSION_KEY = "agent:main:main"
+# Cap on request body size for /chat/send and /chat/stream. Defends against
+# a malicious Content-Length header allocating arbitrary memory. A chat
+# message of 256KB is plenty (~50 pages of plain text).
+MAX_BODY_BYTES = 256 * 1024
 
 # Hetzner bridge transforms — keep behavior identical so the UI doesn't
 # regress between providers.
@@ -116,6 +120,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return False
         return True
 
+    def _read_body(self):
+        """Read and JSON-parse the request body with bounded size + validated
+        Content-Length. Returns (body_dict, None) on success or (None, error_response_status)."""
+        raw_len = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_len)
+        except ValueError:
+            self._json({"error": "Invalid Content-Length"}, 400)
+            return None, 400
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._json({"error": f"Request body too large (max {MAX_BODY_BYTES} bytes)"}, 413)
+            return None, 413
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+            return json.loads(raw or b"{}"), None
+        except (ValueError, json.JSONDecodeError):
+            self._json({"error": "Malformed JSON body"}, 400)
+            return None, 400
+
     def log_message(self, *a):
         # Default impl logs every request to stderr; Fly captures stdout/stderr
         # so we mute the noisy access log. Errors still surface via stderr in
@@ -148,32 +171,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ---- chat ----------------------------------------------------------
     def _hist_raw(self):
+        """Returns (messages, error, timed_out). On timeout, callers should
+        treat as transient and report 504 (not 500)."""
         try:
             r = _call_gateway("chat.history", {"sessionKey": SESSION_KEY})
             if r.returncode != 0:
-                return None, r.stderr.strip()
+                return None, r.stderr.strip(), False
             data = json.loads(r.stdout)
-            return _filter_messages(data.get("messages", [])), None
+            return _filter_messages(data.get("messages", [])), None, False
+        except subprocess.TimeoutExpired as e:
+            return None, f"gateway timeout: {e}", True
         except Exception as e:
-            return None, str(e)
+            return None, str(e), False
 
     def _history(self):
         if not self._auth():
             return
-        msgs, err = self._hist_raw()
+        msgs, err, timed_out = self._hist_raw()
         if err is not None:
-            return self._json({"error": err}, 500)
+            return self._json({"error": err}, 504 if timed_out else 500)
         self._json({"messages": msgs})
 
     def _send(self):
         if not self._auth():
             return
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body, body_err = self._read_body()
+            if body_err is not None:
+                return  # _read_body already responded
             msg = body.get("message", "")
             fire_and_forget = bool(body.get("fireAndForget"))
-            if not msg:
+            if not isinstance(msg, str) or not msg.strip():
                 return self._json({"error": "Message required"}, 400)
 
             idem = f"av-{uuid.uuid4().hex[:12]}"
@@ -192,21 +220,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 threading.Thread(target=_bg, daemon=True).start()
                 return self._json({"sent": True})
 
-            prev, _ = self._hist_raw()
-            prev_count = len(prev) if prev else 0
+            # Track the timestamp of the last assistant message we saw before
+            # send — newer is the only reliable "new reply arrived" signal.
+            # The previous len-based check missed replies if openclaw produced
+            # zero net new history events (e.g. dedup'd send).
+            prev, _, _ = self._hist_raw()
+            prev_last_asst_ts = max(
+                (m.get("timestamp", 0) for m in (prev or []) if m.get("role") == "assistant"),
+                default=0,
+            )
 
             try:
                 _call_gateway("chat.send", params, timeout=45)
             except subprocess.TimeoutExpired:
                 pass  # send may finish even after timeout; we poll
 
-            for _ in range(30):
+            # Cap at ~50s of polling so we exit before Vercel's 60s timeout.
+            # That leaves Vercel 10s to serialize + return the response.
+            for _ in range(25):
                 time.sleep(2)
-                h, _ = self._hist_raw()
-                if h and len(h) > prev_count:
-                    for m in reversed(h):
-                        if m["role"] == "assistant":
-                            return self._json(m)
+                h, _, _ = self._hist_raw()
+                if not h:
+                    continue
+                for m in reversed(h):
+                    if m["role"] == "assistant" and m.get("timestamp", 0) > prev_last_asst_ts:
+                        return self._json(m)
             self._json({"error": "Response timeout"}, 504)
         except Exception as e:
             self._json({"error": str(e)}, 500)
@@ -215,10 +253,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._auth():
             return
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
+            body, body_err = self._read_body()
+            if body_err is not None:
+                return
             msg = body.get("message", "")
-            if not msg:
+            if not isinstance(msg, str) or not msg.strip():
                 return self._json({"error": "Message required"}, 400)
 
             self.send_response(200)
@@ -239,8 +278,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     raise ConnectionError("Client disconnected")
 
             _sse("status", {"phase": "sending", "message": "Sending to agent..."})
-            prev, _ = self._hist_raw()
-            prev_count = len(prev) if prev else 0
+            prev, _, _ = self._hist_raw()
+            prev_last_asst_ts = max(
+                (m.get("timestamp", 0) for m in (prev or []) if m.get("role") == "assistant"),
+                default=0,
+            )
 
             idem = f"av-{uuid.uuid4().hex[:12]}"
             send_params = {
@@ -261,32 +303,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=_do_send, daemon=True).start()
             _sse("status", {"phase": "thinking", "message": "Agent is thinking..."})
 
-            max_polls = 60  # ~90s
+            # Cap polls so total elapsed (~52s) stays under Vercel's 60s
+            # function timeout — leaves 8s margin for the final stream flush.
+            max_polls = 35  # 35 * 1.5s = 52.5s
             found = False
             for i in range(max_polls):
                 time.sleep(1.5)
                 if i > 0 and i % 3 == 0:
                     _sse("heartbeat", {"elapsed": int(i * 1.5)})
 
-                h, _ = self._hist_raw()
-                if h and len(h) > prev_count:
-                    for m in reversed(h):
-                        if m["role"] == "assistant":
-                            content = m["content"]
-                            chunk = 20
-                            for j in range(0, len(content), chunk):
-                                _sse("token", {"content": content[j:j + chunk], "done": False})
-                                time.sleep(0.015)
-                            _sse("token", {"content": "", "done": True})
-                            _sse("done", {
-                                "role": "assistant",
-                                "content": content,
-                                "timestamp": m.get("timestamp", int(time.time() * 1000)),
-                            })
-                            found = True
-                            break
-                    if found:
+                h, _, _ = self._hist_raw()
+                if not h:
+                    continue
+                latest_asst = None
+                for m in reversed(h):
+                    if m["role"] == "assistant" and m.get("timestamp", 0) > prev_last_asst_ts:
+                        latest_asst = m
                         break
+                if latest_asst is not None:
+                    content = latest_asst["content"]
+                    chunk = 20
+                    for j in range(0, len(content), chunk):
+                        _sse("token", {"content": content[j:j + chunk], "done": False})
+                        time.sleep(0.015)
+                    _sse("token", {"content": "", "done": True})
+                    _sse("done", {
+                        "role": "assistant",
+                        "content": content,
+                        "timestamp": latest_asst.get("timestamp", int(time.time() * 1000)),
+                    })
+                    found = True
+                    break
 
             if not found:
                 _sse("error", {
