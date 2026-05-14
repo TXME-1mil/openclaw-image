@@ -35,7 +35,11 @@ BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "18790"))
 GATEWAY_URL = os.environ.get("GATEWAY_URL", f"ws://127.0.0.1:{GATEWAY_PORT}/")
 BRIDGE_VERSION = 7
 SESSION_KEY = "agent:main:main"
-PROTOCOL_VERSION = 4
+# Server checks `maxProtocol >= server.PROTOCOL_VERSION && minProtocol <= server.PROTOCOL_VERSION`.
+# Sending a wide range means we negotiate with whatever the gateway is shipping
+# without needing to track its bumps. Schema requires both ≥ 1.
+MIN_PROTOCOL = 1
+MAX_PROTOCOL = 999
 # Cap on request body size for /chat/send and /chat/stream. Defends against
 # a malicious Content-Length header allocating arbitrary memory. A chat
 # message of 256KB is plenty (~50 pages of plain text).
@@ -197,8 +201,8 @@ class GatewayClient:
     async def _handshake(self, ws):
         connect_id = uuid.uuid4().hex
         params = {
-            "minProtocol": PROTOCOL_VERSION,
-            "maxProtocol": PROTOCOL_VERSION,
+            "minProtocol": MIN_PROTOCOL,
+            "maxProtocol": MAX_PROTOCOL,
             "client": {
                 "id": "gateway-client",
                 "displayName": "av-bridge",
@@ -217,16 +221,32 @@ class GatewayClient:
             "method": "connect",
             "params": params,
         }))
-        # Server replies with {type:"res", id, ok:true, payload:{type:"hello-ok", ...}}
-        raw = await asyncio.wait_for(ws.recv(), timeout=15)
-        frame = json.loads(raw)
-        if frame.get("type") != "res" or frame.get("id") != connect_id:
-            raise RuntimeError(f"unexpected handshake frame: {frame}")
-        if not frame.get("ok"):
-            raise RuntimeError(f"handshake rejected: {frame.get('error')}")
-        payload = frame.get("payload", {})
-        if payload.get("type") != "hello-ok":
-            raise RuntimeError(f"handshake missing hello-ok: {payload}")
+        # Server may send pre-handshake `event` frames (e.g.
+        # connect.challenge) before our connect response. Skip those and
+        # wait for the matching res frame. Total budget 20s — generous
+        # because cold gateway startup can be slow.
+        deadline = asyncio.get_event_loop().time() + 20
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise RuntimeError("handshake timeout")
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            try:
+                frame = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            ftype = frame.get("type")
+            if ftype == "event":
+                # connect.challenge / tick / etc — ignore until we get our res
+                continue
+            if ftype != "res" or frame.get("id") != connect_id:
+                raise RuntimeError(f"unexpected handshake frame: {frame}")
+            if not frame.get("ok"):
+                raise RuntimeError(f"handshake rejected: {frame.get('error')}")
+            payload = frame.get("payload", {})
+            if payload.get("type") != "hello-ok":
+                raise RuntimeError(f"handshake missing hello-ok: {payload}")
+            return
 
     async def _read_loop(self, ws):
         async for raw in ws:
